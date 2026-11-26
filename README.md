@@ -25,6 +25,27 @@ A gamified revision game for **ST0510 J2EE Application Development (JAD)** — b
 - **Ordering** — drag & drop (or ▲▼ buttons) to arrange steps correctly
 - **Typing** — free-text answer, normalised (case/space tolerant)
 - **Code fill** — complete a real JSP/JDBC snippet, e.g. `request.______("id")`
+
+### How typed answers are graded
+
+Both typing types use one function, `gradeTyped()` in `src/app.js`. In order:
+
+1. **Exact** after `norm()` — lowercase, trimmed, smart quotes straightened, whitespace collapsed.
+2. **Synonym** — only what the `SYNONYMS` table lists (`tier`/`tiers`, `jspf`/`.jspf`).
+3. **Punctuation-insensitive** — the typist's own trailing `;`, `()`, quotes, `<%= %>` wrapper and
+   the JSP marker (`<% =` → `<%=`, `<%!` → `<%`) are ignored, but **not** punctuation the
+   question's own snippet already supplies (a blank written `%______` keeps the `%`).
+4. **Contained** — `rs.next()` for `next`, `DriverManager.getConnection` for `getConnection`,
+   `java.sql` for `sql`, `${sessionScope.favColor}` for `sessionScope`. Deliberately **not**
+   `hasNext` for `next`, `getParameterValues` for `getParameter`, or `system.out` for `out`.
+5. **One typo** — plain word answers of 5+ characters forgive a single edit (`setCharacterEncodign`).
+
+There is also an explicit **Submit your answer** button, because some mobile keyboards swallow
+Enter; the input listens for Enter too. A wrong answer says why in plain words and shows the
+accepted answer.
+
+`node test-grading.js` runs 90 cases against these rules, reading the real functions out of
+`src/app.js` so the test cannot drift from the app.
 - **Matching** — pair implicit objects to their Java types, cookie attributes to effects
 
 ### Game modes
@@ -64,6 +85,7 @@ index.html            entry point
 data/questions.js     the whole question bank (edit this to add questions)
 src/app.js            game engine (vanilla JS, no dependencies)
 src/styles.css        all styling
+test-grading.js       node test-grading.js - checks the typed/code answer matching
 sources/              the original lecture decks and practicals the questions came from
 ```
 

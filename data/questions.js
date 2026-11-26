@@ -209,7 +209,7 @@ window.QUESTION_BANK = {
       id: "jsp5", topic: "jsp", type: "code", difficulty: 2,
       q: "Complete the opening tag so the method becomes a member of the generated servlet class.",
       code: "___!\n  private boolean isOdd(int n) {\n    return n % 2 != 0;\n  }\n%>",
-      answers: ["<%", "<% "],
+      answers: ["<%", "<% ", "<%!", "<%! "],
       explain: "A declaration uses <%! ... %>. Its code becomes a member of the servlet class, not part of _jspService()."
     },
     {
@@ -685,7 +685,7 @@ window.QUESTION_BANK = {
       id: "db13", topic: "db", type: "code", difficulty: 2,
       q: "Complete the placeholders used in a parameterised query.",
       code: "String sql = \"INSERT INTO Inventory (ITEM, QTY) VALUES (__, __)\";",
-      answers: ["?", "? ?", "?,?", "?, ?"],
+      answers: ["?", "? ?", "?,?", "?, ?", "'?'", "'?','?'", "'?', '?'"],
       explain: "Each parameter is a ? placeholder; values are bound with pstmt.setString(1, ...), pstmt.setInt(2, ...)."
     },
     {

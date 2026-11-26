@@ -28,6 +28,18 @@
   /* ---------- helpers ---------- */
   function $(sel, root) { return (root || document).querySelector(sel); }
   function $$(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+  /* tap: work on touchstart/pointerup too, so in-app browsers and iOS Safari
+     still register the press even when the synthetic click is swallowed */
+  function tap(el, fn) {
+    if (!el) return;
+    var last = 0;
+    el.addEventListener("click", function (e) { last = Date.now(); fn(e); });
+    el.addEventListener("pointerup", function (e) {
+      if (e.pointerType === "mouse") return;
+      if (Date.now() - last < 700) return;
+      last = Date.now(); fn(e);
+    }, { passive: true });
+  }
   function shuffle(a) { a = a.slice(); for (var i = a.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
   function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
   function levelOf(xp) { return Math.floor(Math.sqrt(xp / 60)) + 1; }
@@ -76,9 +88,279 @@
 
   function norm(s) {
     return String(s == null ? "" : s)
+      .replace(/[\u00a0\u2007\u202f]/g, " ")   // non-breaking spaces from mobile keyboards
       .trim().toLowerCase()
-      .replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"')
+      .replace(/[\u2018\u2019\u02bc]/g, "'").replace(/[\u201c\u201d]/g, '"')
       .replace(/\s+/g, " ");
+  }
+
+  /* Strip everything a typist may add or drop around a code token:
+     trailing semicolon, outer brackets, spaces, trailing parentheses. */
+  /* The missing token a code question asks for, taken from the blank markers
+     in the snippet: "rs.______()" -> "()". Used so a lone "%" does not swallow
+     a typed "%>" or a typed "(" does not swallow "()". */
+  function blankAffix(q) {
+    if (!q || !q.code) return { pre: "", post: "", joined: false, tail: "" };
+    var re = /(\S*)_+(\S*)/g, m, last = null;
+    while ((m = re.exec(q.code)) !== null) last = m;
+    if (!last) return { pre: "", post: "", joined: false, tail: "" };
+    // the snippet's own punctuation right after the blank: "?" for "(____)", ")" for "rs.____()"
+    var tail = (last[2] || "").replace(/[a-z0-9_\s]/gi, "").charAt(0);
+    // "(____)" -> the typed token joins the bracket; "rs.____()" -> it does not
+    var joined = /[\(\[\{<>]$/.test(last[1] || "");
+    if (!(last[1] || "")) {
+      // blank opens the line: whatever trails the line is what the answer ends with
+      var line = q.code.slice(last.index + last[0].length).split("\n")[0];
+      var bang = line.lastIndexOf("!");
+      if (bang >= 0) last[2] = line.slice(bang);
+    }
+    return { pre: last[1] || "", post: last[2] || "", joined: joined, tail: tail };
+  }
+
+  /* Trim punctuation a typist adds on the ends and the answer does not need.
+     Whatever the snippet itself puts next to the blank is kept, so "%>" stays
+     "%>" when the blank is "%___" and drops to "%" when it is "%___>". */
+  function stripTrail(s, post) {
+    var prev;
+    post = post || "";
+    do {
+      prev = s;
+      s = s.replace(/\s+/g, "")
+        .replace(/[;,]+$/, "")            // the typist's ;
+        .replace(/\(\)$/, "");            // the typist's ()
+      if (!/[%>]/.test(post)) s = s.replace(/([^%])["'`]$/, "$1");
+      if (post.indexOf(">") < 0) s = s.replace(/>$/, "");
+      if (post.indexOf("%") < 0 && s !== "%") s = s.replace(/%$/, "");
+    } while (s !== prev && s.length);
+    return s;
+  }
+
+  /* The single canonical form of a code answer: lowercased, the typist's own
+     trailing punctuation removed, and the JSP marker normalised. */
+  function looseCode(s, q) {
+    var post = blankAffix(q).post;
+    var v = stripTrail(norm(s), post);
+
+    // "<% =" -> "<%=", "<%!" -> "<%", "<%" -> "%"
+    if (/^<\s*%[=!@]?$/.test(v)) {
+      v = v.replace(/\s+/g, "");
+      v = v === "<%" ? "%" : v.slice(1);
+    }
+    // a typed "<%= x %>" wrapper around the answer
+    var w = v.match(/^<\s*%[=!@]?\s*([\s\S]*?)\s*%>$/);
+    if (w && w[1].trim()) v = w[1];
+
+    // a quoted string typed with its quotes: "displayinmyjsp1.jsp" / "displayinmyjsp1.jsp
+    var m = v.match(/^'([\s\S]*)'?$/) || v.match(/^"([\s\S]*)"?$/);
+    if (m && m[1]) v = m[1];
+
+    return stripTrail(v, post);
+  }
+
+  /* Is the typed code answer equal to any accepted one, under looseCode? */
+  function codeMatches(q, raw) {
+    var typed = looseCode(raw, q);
+    if (!typed) return false;
+    return q.answers.some(function (a) {
+      var acc = looseCode(a, q);
+      if (acc === typed) return true;
+      // the snippet's own punctuation is what the answer ends with: "?" -> "?)"
+      var tail = blankAffix(q).tail;
+      if (tail && (typed === acc + tail || typed === acc.replace(/[^a-z0-9]+$/, "") + tail)) return true;
+      // typed the whole call the token belongs to: rs.next() for next,
+      // DriverManager.getConnection for getConnection
+      var at = typed.indexOf(acc);
+      if (at < 0) return false;
+      var before = at === 0 ? "" : typed.charAt(at - 1);
+      var after = typed.charAt(at + acc.length) || "";
+      if (!before) return false;
+      if (!/[.\s(]/.test(before)) return false;
+      if (after && !/[\s(.;)\[\]]/.test(after)) return false;
+      return true;
+    });
+  }
+
+  /* Typed a whole line where only a token was wanted: getParameter("loginid")
+     for getParameter, request.getParameter for getParameter. The typed text has
+     to start with the accepted token on a word boundary and then open a bracket
+     or dot, so "getParameterValues" and "hasNext" stay wrong. */
+  function callMatches(q, raw) {
+    var v = norm(raw).replace(/\s+/g, "");
+    return q.answers.some(function (a) {
+      var na = norm(a).replace(/\s+/g, "");
+      if (!na || v.length <= na.length) return false;
+      if (v.indexOf(na) !== 0) return false;
+      // typed on: getParameter("loginid") / request.getParameter - a bracket or a dot
+      // opens right after the token, so getParameterValues and hasNext stay wrong
+      if (!/[\(.\[\{]/.test(v.charAt(na.length))) return false;
+      // and what follows has to be closed or a plain string, not another identifier
+      var rest = v.slice(na.length);
+      if (/^[\(\[\{]?[a-z0-9_]+\(/.test(rest)) return false;
+      return true;
+    });
+  }
+
+  /* Words that mean the same thing in this module. A typed synonym is
+     accepted only when the question lists it, so answers stay exact. */
+  var SYNONYMS = {
+    "out": ["jspwriter"],
+    "jspf": [".jspf"],
+    "tier": ["tiers"],
+    "where": []
+  };
+  /* Java objects whose member names are not package segments. */
+  var KNOWN_OBJECTS = ["system", "session", "request", "response", "out", "rs", "stmt",
+                       "pstmt", "conn", "application", "pagecontext", "config", "this",
+                       "class", "math", "string", "page"];
+
+  function synonymMatch(q, v) {
+    return q.answers.some(function (a) {
+      var syn = SYNONYMS[norm(a)] || [];
+      return syn.some(function (x) { return norm(x) === v; });
+    });
+  }
+
+  /* Last-resort comparison for typed words and code tokens: is the typed
+     answer contained in an accepted one, or the other way round? */
+  function containsMatch(q, raw) {
+    var lc = norm(raw);
+    if (lc.length < 3) return false;
+    return q.answers.some(function (a) {
+      var la = norm(a);
+      if (la.length < 3) return false;
+      if (la === lc) return true;
+
+      var at0 = lc.indexOf(la);
+
+      // 1) wrapped in expression syntax: ${sessionScope.favColor}, request.getParameter(...)
+      if (at0 > 0) {
+        var pre = lc.charAt(at0 - 1);
+        if (pre === "{" || pre === "(" || pre === "[" || pre === "<" || pre === "\"" || pre === "'") return true;
+        if (pre === " " || pre === "\t") return true;
+      }
+
+      // 2) package-qualified: java.sql for sql, jakarta.servlet.jsp.JspWriter
+      //    for JspWriter. A member access (system.out) is not a package.
+      if (lc.charAt(at0 - 1) === ".") {
+        var pkg = lc.slice(0, at0 - 1);
+        if (/^[a-z][a-z0-9]*$/.test(pkg) && KNOWN_OBJECTS.indexOf(pkg) < 0) return true;
+        if (/^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/.test(pkg)) return true;
+        return false;
+      }
+
+      // 3) the typed answer is longer and starts with the accepted one
+      if (at0 === 0 && lc.length > la.length) return true;
+
+      // 4) a shorter typed answer that is the end of the accepted one on a
+      //    word boundary: "sql" for java.sql
+      var at = la.lastIndexOf(lc);
+      if (at > 0 && at + lc.length === la.length) {
+        var before = la.charAt(at - 1);
+        if (!(before >= "a" && before <= "z") && !(before >= "0" && before <= "9")) return true;
+      }
+      return false;
+    });
+  }
+
+  /* Levenshtein distance, capped early - used to forgive one small typo. */
+  function editDistance(a, b) {
+    var m = a.length, n = b.length;
+    if (Math.abs(m - n) > 2) return 99;
+    var prev = [], cur = [], i, j;
+    for (j = 0; j <= n; j++) prev[j] = j;
+    for (i = 1; i <= m; i++) {
+      cur[0] = i;
+      for (j = 1; j <= n; j++) {
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1));
+      }
+      prev = cur.slice();
+    }
+    return prev[n];
+  }
+
+  /* THE single place that decides whether a typed answer is accepted.
+     Order: exact -> punctuation-insensitive -> contained -> one typo. */
+  function gradeTyped(q, raw) {
+    var v = norm(raw);
+    if (!v) return false;
+    if (q.answers.some(function (a) { return norm(a) === v; })) return true;
+    if (synonymMatch(q, v)) return true;
+    if (q.type === "code") {
+      if (codeMatches(q, raw)) return true;
+      if (callMatches(q, raw)) return true;
+    } else {
+      // plain word answers: ignore a trailing . ; : the typist added
+      if (q.answers.some(function (a) { return norm(a).replace(/[.;:]+$/, "") === v; })) return true;
+    }
+    if (q.type !== "code") {
+      if (containsMatch(q, raw)) return true;
+    }
+    if (q.type !== "code" && v.length >= 5) {
+      return q.answers.some(function (a) {
+        var na = norm(a);
+        return Math.abs(na.length - v.length) <= 1 &&
+               editDistance(na, v) <= Math.max(1, Math.floor(na.length / 6));
+      });
+    }
+    return false;
+  }
+
+  /* Levenshtein distance, capped early - used to forgive one small typo. */
+  function editDistance(a, b) {
+    var m = a.length, n = b.length;
+    if (Math.abs(m - n) > 2) return 99;
+    var prev = [], cur = [], i, j;
+    for (j = 0; j <= n; j++) prev[j] = j;
+    for (i = 1; i <= m; i++) {
+      cur[0] = i;
+      for (j = 1; j <= n; j++) {
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1));
+      }
+      prev = cur.slice();
+    }
+    return prev[n];
+  }
+
+  /* THE single place that decides whether a typed answer is accepted.
+     Order: exact -> synonym -> punctuation-insensitive -> contained -> one typo. */
+  function gradeTyped(q, raw) {
+    var v = norm(raw);
+    if (!v) return false;
+    if (q.answers.some(function (a) { return norm(a) === v; })) return true;
+    if (synonymMatch(q, v)) return true;
+    if (q.type === "code") {
+      if (codeMatches(q, raw)) return true;
+      if (callMatches(q, raw)) return true;
+    } else {
+      // plain word answers: ignore a trailing . ; : the typist added
+      if (q.answers.some(function (a) { return norm(a).replace(/[.;:]+$/, "") === v; })) return true;
+      // ...or a whole qualified name containing it: java.sql for sql
+      if (v.length >= 5 && q.answers.some(function (a) {
+        var na = norm(a), at = v.indexOf(na);
+        return at >= 0 && /[^a-z0-9]/.test(v.charAt(at - 1) || " ") &&
+               /[^a-z0-9]/.test(v.charAt(at + na.length) || " ");
+      })) return true;
+    }
+    if (containsMatch(q, raw)) return true;
+    if (q.type !== "code" && v.length >= 5) {
+      return q.answers.some(function (a) {
+        var na = norm(a);
+        return Math.abs(na.length - v.length) <= 1 &&
+               editDistance(na, v) <= Math.max(1, Math.floor(na.length / 6));
+      });
+    }
+    return false;
+  }
+
+  /* A short, plain-language reason a typed answer was rejected. */
+  function whyNot(q, v) {
+    if (!v) return "You submitted an empty answer.";
+    if (q.type === "code") {
+      if (/[;{}]\s*$/.test(v)) return "Close - but type only the missing token, not the surrounding ; { } punctuation.";
+      if (/^[<(%!@=]/.test(v)) return "Close - the answer is the token itself; leave out the surrounding JSP tags.";
+      return "That is not the token the snippet expects. Read the line just above and below the blank.";
+    }
+    return "Not the word I was looking for - check the spelling and the exact term from the slides.";
   }
 
   /* ---------- build a run ---------- */
@@ -196,18 +478,18 @@
     );
 
     $$(".topic").forEach(function (b) {
-      b.addEventListener("click", function () { startRun(b.dataset.topic, "focus"); });
+      tap(b, function () { startRun(b.dataset.topic, "focus"); });
     });
     $$(".mode[data-mode]").forEach(function (b) {
-      b.addEventListener("click", function () { startRun(b.dataset.topic || "mixed", b.dataset.mode); });
+      tap(b, function () { startRun(b.dataset.topic || "mixed", b.dataset.mode); });
     });
-    $("#reviewBtn").addEventListener("click", function () {
+    tap($("#reviewBtn"), function () {
       var wrong = ALL.filter(function (q) { return save.wrong[q.id]; });
       if (!wrong.length) { toast("Nothing to review yet - play a round first!"); return; }
       startRun("review", "focus");
     });
-    $("#soundBtn").addEventListener("click", function () { save.sound = !save.sound; persist(); home(); });
-    $("#resetBtn").addEventListener("click", function () {
+    tap($("#soundBtn"), function () { save.sound = !save.sound; persist(); home(); });
+    tap($("#resetBtn"), function () {
       if (confirm("Reset all XP, streaks and mastered questions?")) {
         save = { xp: 0, streak: 0, best: {}, seen: {}, wrong: {}, mastered: {}, runs: 0, sound: save.sound, totalCorrect: 0, totalAsked: 0, daily: {} };
         persist(); home();
@@ -282,7 +564,7 @@
   }
 
   function bindQuit() {
-    $("#quitBtn").addEventListener("click", function () {
+    tap($("#quitBtn"), function () {
       if (confirm("Quit this round? Progress so far is kept.")) { stopTimer(); endRun(true); }
     });
   }
@@ -296,7 +578,7 @@
     bindQuit();
     var picked = false;
     $$(".opt").forEach(function (b) {
-      b.addEventListener("click", function () {
+      tap(b, function () {
         if (picked) return;
         picked = true; stopTimer();
         var i = +b.dataset.i, ok = i === q._answerShuffled;
@@ -321,7 +603,7 @@
     bindQuit();
     var chosen = {};
     $$(".opt").forEach(function (b) {
-      b.addEventListener("click", function () {
+      tap(b, function () {
         var i = +b.dataset.i;
         chosen[i] = !chosen[i];
         b.classList.toggle("sel", !!chosen[i]);
@@ -333,7 +615,7 @@
     btn.className = "primary"; btn.textContent = "Submit answer";
     $("#actions").appendChild(btn);
     var done = false;
-    btn.addEventListener("click", function () {
+    tap(btn, function () {
       if (done) return; done = true; stopTimer();
       var got = Object.keys(chosen).filter(function (k) { return chosen[k]; }).map(Number).sort(function (a, b) { return a - b; });
       var want = q._answerShuffled;
@@ -402,7 +684,7 @@
     btn.className = "primary"; btn.textContent = "Lock in order";
     $("#actions").appendChild(btn);
     var done = false;
-    btn.addEventListener("click", function () {
+    tap(btn, function () {
       if (done) return; done = true; stopTimer();
       var got = $$(".ordItem", ul).map(function (li) { return li.dataset.t; });
       var ok = got.length === q._correctOrder.length && got.every(function (v, i) { return v === q._correctOrder[i]; });
@@ -421,32 +703,52 @@
     var body = isCode
       ? '<pre class="code"><code>' + esc(q.code).replace(/_{2,}/g, '<span class="blank">____</span>') + '</code></pre>'
       : "";
+    var hint = isCode
+      ? "Type only the missing token, then press <b>Submit</b>. Case, spaces and a trailing <code>;</code> are ignored."
+      : "Press <b>Submit</b> or Enter. Case and extra spaces are ignored.";
     screen(questionShell(q, body +
-      '<form class="typeForm" id="typeForm" autocomplete="off">' +
-        '<input id="typeInput" class="typeInput' + (isCode ? " mono" : "") + '" placeholder="' + (isCode ? "the missing code" : "your answer") + '" autocapitalize="off" autocorrect="off" spellcheck="false" />' +
+      '<form class="typeForm" id="typeForm" autocomplete="off" novalidate>' +
+        '<input id="typeInput" class="typeInput' + (isCode ? " mono" : "") + '" placeholder="' + (isCode ? "the missing code" : "your answer") + '" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" enterkeyhint="done" inputmode="' + (isCode ? "text" : "text") + '" />' +
       '</form>' +
-      '<p class="hint">Enter to submit. Close enough counts.</p>'
+      '<p class="hint">' + hint + '</p>'
     ));
     bindQuit();
     var input = $("#typeInput");
     setTimeout(function () { input.focus(); }, 60);
     var done = false;
-    $("#typeForm").addEventListener("submit", function (e) {
-      e.preventDefault();
-      if (done) return; done = true; stopTimer();
-      var v = norm(input.value);
-      var ok = !!v && q.answers.some(function (a) { return norm(a) === v; });
-      if (!ok && v) {
-        // tolerate surrounding punctuation / partial code answers
-        ok = q.answers.some(function (a) {
-          var na = norm(a);
-          return na.length > 2 && (v === na.replace(/[;{}()"']/g, "") || na === v.replace(/[;{}()"']/g, ""));
-        });
-      }
+
+    function check() {
+      if (done) return;
+      var raw = input.value;
+      var v = norm(raw);
+      if (!v) { toast("Type your answer first"); input.focus(); return; }
+      done = true; stopTimer();
+
+      var ok = gradeTyped(q, raw);
+
       input.classList.add(ok ? "right" : "wrong");
       input.disabled = true;
-      resolve(q, ok, ok ? "" : "Accepted: " + q.answers[0]);
+      var sub = document.querySelector("#submitType");
+      if (sub) { sub.disabled = true; sub.textContent = ok ? "Correct ✓" : "Try next one →"; }
+      resolve(q, ok, ok ? "" : whyNot(q, v) + " Accepted: " + q.answers[0]);
+    }
+
+    $("#typeForm").addEventListener("submit", function (e) { e.preventDefault(); check(); });
+    // some mobile keyboards never fire submit - catch the "Go"/Enter key directly
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.keyCode === 13) { e.preventDefault(); check(); }
     });
+    input.addEventListener("input", function () {
+      if (input.classList.contains("wrong")) input.classList.remove("wrong");
+    });
+
+    // an explicit Submit button - mobile keyboards' "Go" key is unreliable in in-app browsers
+    var sub = document.createElement("button");
+    sub.type = "button"; sub.id = "submitType"; sub.className = "primary"; sub.textContent = "Submit your answer";
+    sub.setAttribute("aria-label", "Submit your answer");
+    $("#actions").appendChild(sub);
+    tap(sub, check);
+
     startTimerIfNeeded(function () { if (!done) { done = true; input.disabled = true; resolve(q, false, "Out of time! Accepted: " + q.answers[0]); } });
   }
 
@@ -463,14 +765,14 @@
     bindQuit();
     var sel = null, assigned = {};
     $$(".mLeft").forEach(function (el) {
-      el.addEventListener("click", function () {
+      tap(el, function () {
         if (el.classList.contains("locked")) return;
         $$(".mLeft").forEach(function (x) { x.classList.remove("sel"); });
         el.classList.add("sel"); sel = el; SFX.tap();
       });
     });
     $$(".mRight").forEach(function (b) {
-      b.addEventListener("click", function () {
+      tap(b, function () {
         if (!sel) { toast("Pick a left item first"); return; }
         var i = sel.dataset.i;
         // free previous holder of this right
@@ -484,7 +786,7 @@
     btn.className = "primary"; btn.textContent = "Check matches";
     $("#actions").appendChild(btn);
     var done = false;
-    btn.addEventListener("click", function () {
+    tap(btn, function () {
       if (done) return;
       if (Object.keys(assigned).length < q.pairs.length) { toast("Match every item first"); return; }
       done = true; stopTimer();
@@ -572,7 +874,7 @@
     next.textContent = (outOfLives || isLast) ? "See results →" : "Next →";
     actions.appendChild(next);
     next.focus();
-    next.addEventListener("click", function () {
+    tap(next, function () {
       if (outOfLives || isLast) return endRun();
       run.i++; renderQuestion();
     });
@@ -619,8 +921,8 @@
       '</main>'
     );
     if (acc >= 90) SFX.level();
-    $("#againBtn").addEventListener("click", function () { startRun(run.topic, run.mode); });
-    $("#homeBtn").addEventListener("click", home);
+    tap($("#againBtn"), function () { startRun(run.topic, run.mode); });
+    tap($("#homeBtn"), home);
   }
 
   /* --- toast --- */
